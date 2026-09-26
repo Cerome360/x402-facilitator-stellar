@@ -6,7 +6,11 @@
  * pagination, and the truthfulness of the `partialResults` flag when no
  * embedding provider is configured.
  *
- * Every public interface below follows TSDoc-style block comments so the
+ * Fixtures, store seeding and response assertions are extracted into
+ * ./helpers/catalog-search.js so each subtest below reads as a behavioural
+ * spec rather than setup boilerplate.
+ *
+ * Every public interface follows TSDoc-style block comments so the
  * business intent is legible without reading the implementation.
  */
 import test from 'node:test';
@@ -24,13 +28,13 @@ import {
 /**
  * Catalog search suite.
  *
- * Seeds a shared {@link MemoryCatalogStore} with two baseline resources:
+ * Seeds a shared store via seededSearchStore() with two baseline resources:
  *
  * 1. "Weather API" — ingested from the `payment` stream, carrying a `custom`
  *    extension whose description contains indexed free-text ("secret token").
  * 2. "Finance API" — ingested from the `manual` stream.
  *
- * The subtests are order-dependent by design: later cases (ranking,
+ * The subtests are order-dependent by design: later ones (ranking,
  * pagination) rely on fixtures introduced by earlier ones, so they run
  * sequentially against the same store instance.
  *
@@ -40,46 +44,6 @@ test('Catalog search tests', async t => {
   // Shared store: subtests are intentionally ordered — later ones (ranking,
   // pagination) depend on the fixtures added by earlier ones.
   const store = await seededSearchStore();
-  const store = new MemoryCatalogStore();
-
-  // Baseline fixture 1: a payment-sourced weather API whose `custom`
-  // extension description is indexed for free-text search.
-  await store.upsertResource(
-    {
-      url: 'https://example.com/api',
-      serviceName: 'Weather API',
-      description: 'Get current weather',
-      tags: ['weather', 'forecast'],
-      type: 'http',
-      payTo: 'G123',
-      scheme: 'exact',
-      network: 'stellar:pubnet',
-      extensions: {
-        bazaar: { info: 'bazaar config' },
-        custom: { description: 'secret token parameter' },
-      },
-    },
-    'payment',
-  );
-
-  // Separate the two upserts so first_seen_at differs; ranking falls back to
-  // recency when relevance ties, so identical timestamps would be flaky.
-  await new Promise(r => setTimeout(r, 10)); // Ensure different first_seen_at
-
-  // Baseline fixture 2: a manually catalogued finance API.
-  await store.upsertResource(
-    {
-      url: 'https://example.com/api2',
-      serviceName: 'Finance API',
-      description: 'Get stock prices',
-      tags: ['finance', 'stock'],
-      type: 'http',
-      payTo: 'G123',
-      scheme: 'exact',
-      network: 'stellar:pubnet',
-    },
-    'manual',
-  );
 
   /**
    * Asserts the search response conforms to the discovery contract:
@@ -155,6 +119,11 @@ test('Catalog search tests', async t => {
   });
 });
 
+/**
+ * Unit tests for the extracted helper components themselves, covering the
+ * edge cases the refactor touched: override merging, fixture isolation,
+ * assertion failure messages, and seed contents.
+ */
 test('catalog search helper components', async t => {
   await t.test('seededSearchStore seeds both baseline fixtures', async () => {
     const store = await seededSearchStore();
