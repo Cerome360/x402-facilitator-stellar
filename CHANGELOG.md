@@ -30,6 +30,14 @@ pinned.
 
 ### Fixed
 
+- Catalog descriptions are truncated at 200 characters without splitting a
+  surrogate pair (#218). A description whose 200th UTF-16 code unit was the high
+  half of an astral character (an emoji in a listing blurb) previously reached
+  discovery with an unpaired surrogate attached — not valid UTF-16, rendered as
+  U+FFFD by a conformant client and not round-trippable through a `jsonb`
+  column. The emitted description is now always valid UTF-16 and never longer
+  than 200 code units, and the truncation is still reported as the
+  `description_truncated` soft drop.
 - `server.js` now installs `unhandledRejection` / `uncaughtException` handlers
   and reports a listen or metrics-listener bind failure, exiting non-zero with
   a diagnostic instead of dying silently (#205).
