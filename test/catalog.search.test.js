@@ -6,69 +6,44 @@
  * pagination, and the truthfulness of the `partialResults` flag when no
  * embedding provider is configured.
  *
- * Every public interface below follows TSDoc-style block comments so the
+ * Fixtures, store seeding and response assertions are extracted into
+ * ./helpers/catalog-search.js so each subtest below reads as a behavioural
+ * spec rather than setup boilerplate.
+ *
+ * Every public interface follows TSDoc-style block comments so the
  * business intent is legible without reading the implementation.
  */
 import test from 'node:test';
 import assert from 'node:assert';
-import { MemoryCatalogStore } from '../src/catalog/memory.js';
+import {
+  assertSearchShape,
+  assertServiceNames,
+  financeResource,
+  seededSearchStore,
+  settleClock,
+  weatherResource,
+  weatherTwoResource,
+} from './helpers/catalog-search.js';
 
 /**
  * Catalog search suite.
  *
- * Seeds a shared {@link MemoryCatalogStore} with two baseline resources:
+ * Seeds a shared store via seededSearchStore() with two baseline resources:
  *
  * 1. "Weather API" — ingested from the `payment` stream, carrying a `custom`
  *    extension whose description contains indexed free-text ("secret token").
  * 2. "Finance API" — ingested from the `manual` stream.
  *
- * The subtests are order-dependent by design: later cases (ranking,
+ * The subtests are order-dependent by design: later ones (ranking,
  * pagination) rely on fixtures introduced by earlier ones, so they run
  * sequentially against the same store instance.
  *
  * @param t - Node test context used to register the nested subtests.
  */
 test('Catalog search tests', async t => {
-  const store = new MemoryCatalogStore();
-
-  // Baseline fixture 1: a payment-sourced weather API whose `custom`
-  // extension description is indexed for free-text search.
-  await store.upsertResource(
-    {
-      url: 'https://example.com/api',
-      serviceName: 'Weather API',
-      description: 'Get current weather',
-      tags: ['weather', 'forecast'],
-      type: 'http',
-      payTo: 'G123',
-      scheme: 'exact',
-      network: 'stellar:pubnet',
-      extensions: {
-        bazaar: { info: 'bazaar config' },
-        custom: { description: 'secret token parameter' },
-      },
-    },
-    'payment',
-  );
-
-  // Separate the two upserts so first_seen_at differs; ranking falls back to
-  // recency when relevance ties, so identical timestamps would be flaky.
-  await new Promise(r => setTimeout(r, 10)); // Ensure different first_seen_at
-
-  // Baseline fixture 2: a manually catalogued finance API.
-  await store.upsertResource(
-    {
-      url: 'https://example.com/api2',
-      serviceName: 'Finance API',
-      description: 'Get stock prices',
-      tags: ['finance', 'stock'],
-      type: 'http',
-      payTo: 'G123',
-      scheme: 'exact',
-      network: 'stellar:pubnet',
-    },
-    'manual',
-  );
+  // Shared store: subtests are intentionally ordered — later ones (ranking,
+  // pagination) depend on the fixtures added by earlier ones.
+  const store = await seededSearchStore();
 
   /**
    * Asserts the search response conforms to the discovery contract:
@@ -79,9 +54,7 @@ test('Catalog search tests', async t => {
    */
   await t.test('conforms to response shape', async () => {
     const res = await store.search({ query: 'api' });
-    assert.ok(res.resources, 'Has resources array');
-    assert.ok(res.pagination, 'Has pagination');
-    assert.strictEqual(res.total, undefined, 'Does not have total');
+    assertSearchShape(res);
     assert.strictEqual(res.resources.length, 2);
     assert.strictEqual(res.partialResults, true); // true because no embedding provider is configured
   });
@@ -93,8 +66,7 @@ test('Catalog search tests', async t => {
    */
   await t.test('filters compose with query', async () => {
     const res = await store.search({ query: 'api', extensions: ['custom'] });
-    assert.strictEqual(res.resources.length, 1);
-    assert.strictEqual(res.resources[0].serviceName, 'Weather API');
+    assertServiceNames(res, ['Weather API']);
   });
 
   /**
@@ -104,8 +76,7 @@ test('Catalog search tests', async t => {
    */
   await t.test('extensions are indexed', async () => {
     const res = await store.search({ query: 'secret token' });
-    assert.strictEqual(res.resources.length, 1);
-    assert.strictEqual(res.resources[0].serviceName, 'Weather API');
+    assertServiceNames(res, ['Weather API']);
   });
 
   /**
@@ -115,17 +86,10 @@ test('Catalog search tests', async t => {
    * Adds a third fixture inline so the tie-break is observable.
    */
   await t.test('ranking: payment outranks manual', async () => {
-    await store.upsertResource(
-      {
-        url: 'https://example.com/api3',
-        serviceName: 'Weather API 2',
-        type: 'http',
-      },
-      'manual',
-    );
+    await store.upsertResource(weatherTwoResource(), 'manual');
     const res = await store.search({ query: 'weather' });
-    assert.strictEqual(res.resources[0].serviceName, 'Weather API');
-    assert.strictEqual(res.resources[1].serviceName, 'Weather API 2');
+    // Payment-sourced resource outranks the manual one on equal relevance.
+    assertServiceNames(res, ['Weather API', 'Weather API 2']);
   });
 
   /**
@@ -152,5 +116,68 @@ test('Catalog search tests', async t => {
   await t.test('partialResults is truthful (true when provider is unavailable)', async () => {
     const res = await store.search({ query: 'api' });
     assert.strictEqual(res.partialResults, true);
+  });
+});
+
+/**
+ * Unit tests for the extracted helper components themselves, covering the
+ * edge cases the refactor touched: override merging, fixture isolation,
+ * assertion failure messages, and seed contents.
+ */
+test('catalog search helper components', async t => {
+  await t.test('seededSearchStore seeds both baseline fixtures', async () => {
+    const store = await seededSearchStore();
+    const res = await store.search({ query: 'api' });
+    assertServiceNames(res, ['Weather API', 'Finance API']);
+  });
+
+  await t.test('fixture builders apply overrides without mutating defaults', () => {
+    const custom = weatherResource({ serviceName: 'Custom Weather', tags: ['custom'] });
+    assert.strictEqual(custom.serviceName, 'Custom Weather');
+    assert.deepStrictEqual(custom.tags, ['custom']);
+    // Defaults not overridden are preserved.
+    assert.strictEqual(custom.url, 'https://example.com/api');
+
+    // The pristine fixture is untouched by the override above.
+    const pristine = weatherResource();
+    assert.strictEqual(pristine.serviceName, 'Weather API');
+    assert.deepStrictEqual(pristine.tags, ['weather', 'forecast']);
+  });
+
+  await t.test('assertSearchShape rejects a response missing pagination', () => {
+    assert.throws(
+      () => assertSearchShape({ resources: [] }),
+      /pagination/,
+      'assertSearchShape should fail when pagination is absent',
+    );
+  });
+
+  await t.test('assertServiceNames reports the actual ordering on mismatch', () => {
+    const res = { resources: [{ serviceName: 'Finance API' }, { serviceName: 'Weather API' }] };
+    assert.throws(
+      () => assertServiceNames(res, ['Weather API', 'Finance API'], 'ranking'),
+      /ranking/,
+      'assertServiceNames should include the context message',
+    );
+  });
+
+  await t.test('settleClock waits for the requested duration', async () => {
+    const started = Date.now();
+    await settleClock(15);
+    assert.ok(Date.now() - started >= 14, 'settleClock should honour its delay');
+  });
+
+  await t.test('financeResource overrides merge onto the base fixture', () => {
+    const resource = financeResource({ url: 'https://example.com/other', payTo: 'G999' });
+    assert.strictEqual(resource.url, 'https://example.com/other');
+    assert.strictEqual(resource.payTo, 'G999');
+    assert.strictEqual(resource.serviceName, 'Finance API');
+    assert.strictEqual(financeResource().payTo, 'G123');
+  });
+
+  await t.test('weatherTwoResource keeps its minimal footprint by default', () => {
+    const resource = weatherTwoResource();
+    assert.deepStrictEqual(Object.keys(resource).sort(), ['serviceName', 'type', 'url']);
+    assert.strictEqual(resource.type, 'http');
   });
 });
