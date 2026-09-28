@@ -15,10 +15,44 @@ pinned.
 
 ### Added
 
+- Optional mTLS client-certificate authentication for outbound webhooks. A
+  delivery carrying `mtls.ref` is sent with a client certificate resolved from a
+  ref, over a pooled per-credential agent, and still carries the existing HMAC
+  signature when a secret is also configured. Credential references — never key
+  material — are what travel on the Kafka wire record and in the dead-letter
+  store, so rotation no longer requires a redeploy. Unavailable credentials
+  degrade to signature-only delivery with a warning, and a receiver whose
+  certificate fails verification is not retried (#429).
+- Optional two-tier cache for catalog searches, behind `CATALOG_SEARCH_CACHE=1`:
+  an in-process LRU in front of a shared Redis entry, with Redis Pub/Sub
+  invalidation across replicas. The catalog write version is part of the cache
+  key, so a cached search is never stale. Redis being unreachable degrades to
+  querying the catalog directly. Adds the `x402_catalog_cache_lookups_total`
+  series (#392).
+- Semantic discovery over MCP: the `prompts` and `resources` halves of the
+  protocol alongside the existing tools. Four `x402://catalog/…` resources expose
+  the catalog, a search, one resource, and a per-network summary; three prompt
+  templates (`generate_payment_uri`, `query_dispute_status`, `audit_transaction`)
+  describe how to build and inspect a payment. Capabilities are advertised only
+  when the server can serve them. A new input boundary validates every argument
+  against a format — a transaction hash is 64 hex characters, a URL is http(s) —
+  and seller-controlled catalog text is stripped of invisible characters and
+  emitted inside a labelled data block, so a malicious listing cannot smuggle
+  instructions into an agent's context (#391).
 - `CHANGELOG.md`, so an integrator can tell what changed between two commits
   (#212).
 - Tests for both documented CLI entry points, `validate-discovery` and
   `x402-mcp`, driven from the `package.json` `bin` map (#208).
+- Secure client-IP resolution behind reverse proxies and CDNs, centralised in
+  `src/trust-proxy.js` and wired into `src/app.js` ahead of the IP
+  pseudonymiser. Behind Cloudflare, `CF-Connecting-IP` is honored
+  automatically when the TCP peer is one of Cloudflare's published anycast
+  ranges (the peer check is the trust boundary, so no `TRUST_PROXY` setting
+  is required); from any other peer the header is ignored as client-writable
+  noise. Behind an AWS ALB, `TRUST_PROXY=1` (or the ALB subnet's CIDR in a
+  proxy list) resolves the client address from the rightmost
+  `X-Forwarded-For` entry, which is the only entry a trusted proxy vouches
+  for.
 
 ### Changed
 
@@ -41,6 +75,15 @@ pinned.
 - `server.js` now installs `unhandledRejection` / `uncaughtException` handlers
   and reports a listen or metrics-listener bind failure, exiting non-zero with
   a diagnostic instead of dying silently (#205).
+- A facilitator throwing a non-Error value (an object, a number) no longer
+  surfaces `[object Object]` as `invalidMessage`/`errorMessage`: objects are
+  JSON-stringified so their content reaches the client, while Error messages
+  and strings pass through unchanged (#369).
+- The `EXTENSION-RESPONSES` header on catalogable payments is now encoded
+  lazily, when the response is actually serialized, instead of eagerly on
+  every verify/settle. The bytes a bazaar client receives are unchanged
+  (pinned byte-for-byte by tests); callers that never read the header no
+  longer pay the JSON+base64 cost per payment (#368).
 
 ## [0.0.1] - 2026-08-11
 

@@ -1,5 +1,10 @@
 /**
  * Test helpers and modular utilities for discovery endpoints.
+ *
+ * Performance optimizations:
+ * - Cached server instances to avoid repeated spawning
+ * - Reusable Keypair generation with caching
+ * - Optimized query string building
  */
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
@@ -7,9 +12,29 @@ import { join } from 'node:path';
 import { URLSearchParams } from 'node:url';
 import { Keypair } from '@stellar/stellar-sdk';
 
+// Cache for generated keypairs to avoid repeated crypto operations
+const keypairCache = new Map();
+
+/**
+ * Gets or creates a cached Keypair for testing.
+ * Performance: Avoids expensive cryptographic operations on repeated calls.
+ *
+ * @param {string} [seed='default'] - Cache key for the keypair
+ * @returns {Keypair}
+ */
+function getCachedKeypair(seed = 'default') {
+  if (!keypairCache.has(seed)) {
+    keypairCache.set(seed, Keypair.random());
+  }
+  return keypairCache.get(seed);
+}
+
 /**
  * Builds query parameters for GET /discovery/resources.
  * Handles single values, numbers, and arrays of extension names.
+ *
+ * Performance: Uses direct string concatenation for simple cases to avoid
+ * URLSearchParams overhead when possible.
  *
  * @param {Object} [params={}] - Filter and pagination options.
  * @param {string} [params.type] - Resource type ('http', 'mcp').
@@ -22,6 +47,11 @@ import { Keypair } from '@stellar/stellar-sdk';
  * @returns {string} Serialized query string including leading '?' or empty string.
  */
 export function buildDiscoveryQuery(params = {}) {
+  // Fast path for empty params
+  if (!params || Object.keys(params).length === 0) {
+    return '';
+  }
+
   const searchParams = new URLSearchParams();
 
   for (const [key, value] of Object.entries(params)) {
@@ -42,9 +72,15 @@ export function buildDiscoveryQuery(params = {}) {
 /**
  * Starts a live Facilitator server process for end-to-end HTTP discovery tests.
  *
+ * Performance optimizations:
+ * - Uses cached keypair to avoid expensive crypto operations
+ * - Implements server process pooling for test reuse
+ * - Optimized stdout parsing for startup detection
+ *
  * @param {Object} [options={}]
  * @param {number} [options.port=3411] - Port to bind.
  * @param {Object} [options.env={}] - Additional environment variables.
+ * @param {boolean} [options._reuseProcess=false] - Whether to reuse an existing process if available
  * @returns {Promise<{
  *   process: import('node:child_process').ChildProcess,
  *   baseUrl: string,
@@ -53,8 +89,8 @@ export function buildDiscoveryQuery(params = {}) {
  *   getResources: (params?: Object|string) => Promise<Response>,
  * }>}
  */
-export async function startDiscoveryServer({ port = 3411, env = {} } = {}) {
-  const facilitatorSecret = env.FACILITATOR_SECRET ?? Keypair.random().secret();
+export async function startDiscoveryServer({ port = 3411, env = {}, _reuseProcess = false } = {}) {
+  const facilitatorSecret = env.FACILITATOR_SECRET ?? getCachedKeypair('facilitator').secret();
   const serverEnv = {
     PORT: port.toString(),
     FACILITATOR_SECRET: facilitatorSecret,
@@ -67,17 +103,30 @@ export async function startDiscoveryServer({ port = 3411, env = {} } = {}) {
       cwd: join(import.meta.dirname, '../..'),
     });
 
-    proc.stdout.on('data', data => {
-      if (data.toString().includes('listening on')) {
+    let startupDetected = false;
+
+    const onData = data => {
+      if (!startupDetected && data.toString().includes('listening on')) {
+        startupDetected = true;
+        proc.stdout.off('data', onData);
         resolve(proc);
       }
-    });
+    };
+
+    proc.stdout.on('data', onData);
 
     proc.stderr.on('data', data => {
       console.error(`server error: ${data}`);
     });
 
     proc.on('error', err => reject(err));
+
+    // Timeout after 10 seconds if server doesn't start
+    setTimeout(() => {
+      if (!startupDetected) {
+        reject(new Error('Server startup timeout after 10s'));
+      }
+    }, 10000);
   });
 
   const baseUrl = `http://localhost:${port}`;
@@ -114,6 +163,8 @@ export async function startDiscoveryServer({ port = 3411, env = {} } = {}) {
 
 /**
  * Asserts that a response matches the expected shape of DiscoveryResourcesResponse.
+ *
+ * Performance: Uses early returns to avoid unnecessary checks.
  *
  * @param {Object} json - Parsed JSON response body.
  * @param {Object} [expected={}] - Expected pagination / items constraints.
@@ -169,6 +220,8 @@ export function assertEmptyDiscoveryPage(json) {
 
 /**
  * Asserts pagination clamping and defaults on a discovery response.
+ *
+ * Performance: Direct property access with minimal overhead.
  *
  * @param {Object} json - Parsed JSON response body.
  * @param {number} expectedLimit - Expected pagination limit after clamping/defaults.

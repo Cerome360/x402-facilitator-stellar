@@ -326,6 +326,20 @@ export function resolveConfig(env = process.env) {
     databaseUrl: env.DATABASE_URL || null,
 
     /**
+     * Two-tier catalog search cache (#392). Off by default so the behaviour
+     * change is opt-in: with it on, a discovery search can be answered from
+     * this process's L1 for up to CATALOG_CACHE_L1_TTL_MS, and from a shared
+     * L2 for up to 60s. Freshness is still guaranteed by the catalog write
+     * version, which is part of the cache key — the TTLs only bound memory and
+     * bound how long a *missed* cross-node invalidation can linger.
+     *
+     * Set CATALOG_SEARCH_CACHE=1 to enable. It implies a shared L2 only when
+     * REDIS_URL is also set; without it this is a per-process L1, which is
+     * still the majority of the win because discovery traffic is repetitive.
+     */
+    catalogSearchCache: env.CATALOG_SEARCH_CACHE === '1' || env.CATALOG_SEARCH_CACHE === 'true',
+
+    /**
      * CQRS read replica (#121): when DATABASE_URL_REPLICA is set, settlement
      * status reads and the reconciliation sweep are routed to a read replica
      * instead of the primary, so history queries stop contending with writes.
