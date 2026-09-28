@@ -19,6 +19,16 @@ pinned.
   (#212).
 - Tests for both documented CLI entry points, `validate-discovery` and
   `x402-mcp`, driven from the `package.json` `bin` map (#208).
+- Secure client-IP resolution behind reverse proxies and CDNs, centralised in
+  `src/trust-proxy.js` and wired into `src/app.js` ahead of the IP
+  pseudonymiser. Behind Cloudflare, `CF-Connecting-IP` is honored
+  automatically when the TCP peer is one of Cloudflare's published anycast
+  ranges (the peer check is the trust boundary, so no `TRUST_PROXY` setting
+  is required); from any other peer the header is ignored as client-writable
+  noise. Behind an AWS ALB, `TRUST_PROXY=1` (or the ALB subnet's CIDR in a
+  proxy list) resolves the client address from the rightmost
+  `X-Forwarded-For` entry, which is the only entry a trusted proxy vouches
+  for.
 
 ### Changed
 

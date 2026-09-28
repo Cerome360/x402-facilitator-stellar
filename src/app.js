@@ -6,6 +6,7 @@ import { createReadinessChecker } from './readiness.js';
 import { createRequestLog } from './log.js';
 import { createMetrics, signerMetrics } from './metrics.js';
 import { createIpPseudonymizer } from './ip.js';
+import { createTrustProxyHook } from './trust-proxy.js';
 import { lockKeyFor } from './distributed-lock.js';
 import { requestState } from './request-state.js';
 import { buildSettlementStore } from './store/index.js';
@@ -92,7 +93,6 @@ export async function createApp(
   const serveMetrics = extras.serveMetrics !== false;
 
   const app = Fastify({
-    trustProxy: config.trustProxy,
     bodyLimit: BODY_LIMIT_BYTES,
     logger: false,
     ajv: {
@@ -181,19 +181,11 @@ export async function createApp(
     }
   });
 
-  if (typeof config.trustProxy === 'number') {
-    const hops = Math.max(0, Math.floor(config.trustProxy));
-    app.addHook('onRequest', async req => {
-      const raw = req.headers['x-forwarded-for'] ?? '';
-      const forwarded = String(raw)
-        .split(',')
-        .map(s => s.trim())
-        .filter(Boolean);
-      const chain = [...forwarded, req.socket.remoteAddress];
-      const ip = chain[Math.max(0, chain.length - 1 - hops)] ?? req.socket.remoteAddress;
-      Object.defineProperty(req, 'ip', { value: ip, configurable: true });
-    });
-  }
+  // Client-IP resolution behind reverse proxies and CDNs (src/trust-proxy.js)
+  // is the single choke point that decides what req.ip may mean. It runs
+  // ahead of the pseudonymiser below so every consumer — the rate limiter's
+  // bucket key, audit actors — sees the resolved, spoof-resistant address.
+  app.addHook('onRequest', createTrustProxyHook(config.trustProxy));
 
   app.addHook('onRequest', async req => {
     const pseudonym = ipPseudonymizer(req.ip);
