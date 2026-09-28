@@ -369,7 +369,7 @@ export function createMcpClient(env, options = {}) {
         child.kill('SIGTERM');
 
         killTimer = setTimeout(() => {
-          if (!child.killed) child.kill('SIGKILL');
+          if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
         }, killGraceMs);
         killTimer.unref?.();
       } catch (err) {
