@@ -1,9 +1,30 @@
+/**
+ * MCP CLI integration test — the spending guard, end to end.
+ *
+ * Unlike {@link ../test/mcp-server.test.js | `mcp-server.test.js`}, which drives
+ * `McpServer._handleRequest` in-process, this file spawns the real
+ * `src/mcp/cli.js` as a child process and speaks line-delimited JSON-RPC over
+ * its stdin/stdout. That is deliberate: the spending guard is the last line of
+ * defence between an agent and real money, and the only way to be sure it fires
+ * is to exercise the whole path the agent actually uses — process start, stdio
+ * framing, `tools/call`, and the guard itself.
+ *
+ * The protocol-level contract (framing, batching, error tiers) is covered in
+ * {@link ../test/mcp-server.test.js | `mcp-server.test.js`} and
+ * {@link ../test/mcp-transport.test.js | `mcp-transport.test.js`};
+ * this file is only about spending limits, so it stays deliberately small.
+ *
+ * @module mcp-cli-integration-test
+ * @see {@link https://github.com/accensa/x402-facilitator-stellar/blob/main/src/mcp/server.js | MCP Server}
+ * @see {@link https://github.com/accensa/x402-facilitator-stellar/blob/main/src/mcp/cli.js | MCP CLI}
+ */
 import test from 'node:test';
 import assert from 'node:assert';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
+/** Absolute path to the MCP CLI entry point for child-process spawning. */
 const CLI_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), '../src/mcp/cli.js');
 
 /**
@@ -57,10 +78,16 @@ function createMcpClient(env, options = {}) {
     process.stderr.write(d);
   });
 
+  // Monotonic request ids. The server echoes them, so a response can be matched
+  // to its request without ordering assumptions.
   let messageId = 1;
+  /** @type {Map<number, {resolve: Function, reject: Function}>} */
   const pending = new Map();
   let closed = false;
 
+  // The child writes in chunks that do not align with line boundaries, so a
+  // partial trailing line is held in `buffer` until its newline arrives. Without
+  // this, a large response is parsed as truncated JSON and dropped.
   let buffer = '';
   child.stdout.on('data', chunk => {
     buffer += chunk.toString();
@@ -233,6 +260,26 @@ function createMcpClient(env, options = {}) {
   };
 }
 
+/**
+ * Spending control integration test.
+ *
+ * Verifies that the `call_paid_resource` tool enforces per-call and session
+ * spending caps. A real HTTP 402 challenge is required because the tool reads
+ * the price out of the challenge body — a stub that returned a fixed price
+ * would let the cap logic pass while the real parsing path was broken.
+ *
+ * Test setup:
+ * - Per-call cap: 500 stroops
+ * - Session cap: 1000 stroops
+ * - Test resource: 600 stroops (exceeds the per-call cap)
+ *
+ * The test asserts that the 600-stroop resource is refused by the per-call cap.
+ * After each test, teardown runs in reverse dependency order to ensure clean
+ * shutdown: closeConnections before close so server.close() can complete its
+ * handshake, and the child is killed last so it cannot outlive the fixture.
+ *
+ * @see {@link https://github.com/accensa/x402-facilitator-stellar/blob/main/src/mcp/cli.js | MCP CLI spending guard}
+ */
 test('MCP Server Spending Controls', async t => {
   let client;
   const serverRef = { current: null };
@@ -276,9 +323,7 @@ test('MCP Server Spending Controls', async t => {
   const http = await import('node:http');
   const server = http.createServer((req, res) => {
     if (req.url === '/test-200-stroops') {
-      res.writeHead(402, {
-        'Content-Type': 'application/json',
-      });
+      res.writeHead(402, { 'Content-Type': 'application/json' });
       res.end(
         JSON.stringify({
           error: 'payment_required',
@@ -294,9 +339,7 @@ test('MCP Server Spending Controls', async t => {
         }),
       );
     } else if (req.url === '/test-600-stroops') {
-      res.writeHead(402, {
-        'Content-Type': 'application/json',
-      });
+      res.writeHead(402, { 'Content-Type': 'application/json' });
       res.end(
         JSON.stringify({
           error: 'payment_required',
@@ -322,11 +365,20 @@ test('MCP Server Spending Controls', async t => {
   const port = server.address().port;
   const url600 = `http://localhost:${port}/test-600-stroops`;
 
+  /**
+   * Enforces the per-call cap: a 600-stroop resource must be refused when the
+   * cap is 500 stroops. This is the core assertion of the spending guard.
+   *
+   * The guard should reject the request and the error message must contain
+   * "Spending refused" and "exceeds per-call limit".
+   *
+   * @see {@link https://github.com/accensa/x402-facilitator-stellar/blob/main/src/mcp/cli.js | Spending guard logic}
+   */
   await t.test('enforces per-call cap (600 > 500)', async () => {
     try {
-      console.log('Sending call_paid_resource...');
       await client.callTool('call_paid_resource', { url: url600 });
-      console.log('Received response from call_paid_resource, failing test');
+      // Reaching here means the guard let an over-cap payment through — the
+      // failure mode this whole file exists to prevent.
       assert.fail('Should have rejected');
     } catch (err) {
       console.log('Caught error:', err.message);
