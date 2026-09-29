@@ -22,6 +22,14 @@
  *   exit            log to stderr and exit(3) on the first request
  */
 
+// `node --test` collects every JavaScript file under test/, this fixture
+// included, and would run it as a test file. With no peer on the other end of
+// stdin it would sit there forever and hang the entire suite — which is what
+// broke CI (#470). NODE_TEST_CONTEXT is set by the runner in a file it
+// collected, but stripped from the peers this fixture is actually spawned as
+// (see createMcpClient), so it identifies exactly the case that must bail out.
+if (process.env.NODE_TEST_CONTEXT) process.exit(0);
+
 let buffer = '';
 const MODE = process.env.FAKE_MCP_MODE || 'echo';
 

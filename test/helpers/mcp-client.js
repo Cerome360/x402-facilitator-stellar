@@ -195,10 +195,17 @@ export function createMcpClient(env, options = {}) {
     onError = err => console.error('MCP client error:', err),
   } = options;
 
+  // The test runner marks the files it collects with NODE_TEST_CONTEXT. The
+  // child here is a peer process, not a collected test file, so the marker is
+  // stripped — otherwise the scripted fixture would mistake it for a file the
+  // runner is collecting and exit instead of answering (#470).
+  const childEnv = { ...process.env, ...env };
+  delete childEnv.NODE_TEST_CONTEXT;
+
   let child;
   try {
     child = spawn(process.execPath, [cliPath], {
-      env: { ...process.env, ...env },
+      env: childEnv,
       stdio: ['pipe', 'pipe', 'pipe'],
     });
   } catch (err) {

@@ -1,22 +1,35 @@
 /**
- * MCP CLI integration test — the spending guard, end to end.
+ * MCP client and MCP CLI: unit tests, explicit error states, and the spending
+ * controls end to end.
  *
- * Unlike {@link ../test/mcp-server.test.js | `mcp-server.test.js`}, which drives
- * `McpServer._handleRequest` in-process, this file spawns the real
- * `src/mcp/cli.js` as a child process and speaks line-delimited JSON-RPC over
- * its stdin/stdout. That is deliberate: the spending guard is the last line of
- * defence between an agent and real money, and the only way to be sure it fires
- * is to exercise the whole path the agent actually uses — process start, stdio
- * framing, `tools/call`, and the guard itself.
+ * TESTING STRATEGY (#386, #388)
  *
- * The protocol-level contract (framing, batching, error tiers) is covered in
- * {@link ../test/mcp-server.test.js | `mcp-server.test.js`} and
- * {@link ../test/mcp-transport.test.js | `mcp-transport.test.js`};
- * this file is only about spending limits, so it stays deliberately small.
+ * The subject of this file is the test-only MCP client in
+ * ./helpers/mcp-client.js and, through it, the MCP CLI in src/mcp/cli.js. It is
+ * organised so every layer can fail for its own reason:
  *
- * @module mcp-cli-integration-test
- * @see {@link https://github.com/accensa/x402-facilitator-stellar/blob/main/src/mcp/server.js | MCP Server}
- * @see {@link https://github.com/accensa/x402-facilitator-stellar/blob/main/src/mcp/cli.js | MCP CLI}
+ * 1. Primitives (LineFramer, BoundedCapture) are tested in isolation against a
+ *    naive implementation, so "same behaviour, less work" is a comparison
+ *    rather than a claim. The naive reader below is the exact loop the framer
+ *    replaced.
+ * 2. The client's request/response, timeout, framing and teardown paths are
+ *    driven over a real stdio pipe against test/fixtures/mcp/scripted-cli.js,
+ *    which can be told to answer with an error, print non-JSON noise, reply one
+ *    byte at a time, stay silent, or die mid-request.
+ * 3. The paths a real child cannot be made to produce on demand (spawn
+ *    failure, a stdin write that fails or throws, a kill that throws) are
+ *    driven through an injected `spawn`, so they are synchronous and
+ *    deterministic instead of timing-dependent.
+ * 4. The CLI's spending controls are exercised end to end against a mock 402
+ *    server. Every case asserts a refusal that happens *before* signing, which
+ *    keeps the suite offline: no funded account, no testnet, no facilitator.
+ *    The settled-payment path needs real testnet settlement and is covered by
+ *    the conformance workflow (npm run e2e), not here.
+ * 5. Coverage is enforced structurally: every code in
+ *    MCP_CLIENT_ERROR_CODES must be produced by a test in this file, checked by
+ *    the final test. Node's test runner excludes test/ from its coverage
+ *    report, so an exhaustion guard is what keeps "the client's error handling
+ *    is covered" from rotting as codes are added.
  */
 import test from 'node:test';
 import assert from 'node:assert';
@@ -49,8 +62,29 @@ const TEST_PAYER_KEY = 'SBTJBX7IF3W4IU2VRQXK2PPEAQJW5PZTRUQPL4CVIBEL42OE3YLETWWW
 
 const observedCodes = new Set();
 
-/** Absolute path to the MCP CLI entry point for child-process spawning. */
-const CLI_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), '../src/mcp/cli.js');
+async function expectFailure(promise, code, what) {
+  let outcome;
+  try {
+    outcome = { resolved: true, value: await promise };
+  } catch (error) {
+    outcome = { resolved: false, error };
+  }
+
+  assert.strictEqual(
+    outcome.resolved,
+    false,
+    `${what}: expected a ${code} rejection, resolved with ${JSON.stringify(outcome.value)}`,
+  );
+
+  const error = outcome.error;
+  observedCodes.add(error?.code);
+  assert.ok(
+    error instanceof McpClientError,
+    `${what}: expected an McpClientError, got ${error?.name}: ${error?.message}`,
+  );
+  assert.strictEqual(error.code, code, `${what}: unexpected error code (${error.message})`);
+  return error;
+}
 
 /**
  * Records every code an `onError` observer sees, so the coverage guard counts
@@ -113,16 +147,28 @@ function fakeSpawn(child, { throws = null } = {}) {
   return spawn;
 }
 
-  // Monotonic request ids. The server echoes them, so a response can be matched
-  // to its request without ordering assumptions.
-  let messageId = 1;
-  /** @type {Map<number, {resolve: Function, reject: Function}>} */
-  const pending = new Map();
-  let closed = false;
+/** The naive reader the framer replaced; the benchmark's baseline. */
+function naiveLineReader(onLine) {
+  let buffer = '';
+  return {
+    push(chunk) {
+      buffer += chunk.toString();
+      const lines = buffer.split('\n');
+      buffer = lines.pop();
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        onLine(line);
+      }
+    },
+  };
+}
 
-  // The child writes in chunks that do not align with line boundaries, so a
-  // partial trailing line is held in `buffer` until its newline arrives. Without
-  // this, a large response is parsed as truncated JSON and dropped.
+/**
+ * The same loop with a counter for the characters it hands to `split()`. The
+ * counter is the only difference, so the number it reports is the work the
+ * reader above really does — one re-scan of the undelivered tail per read.
+ */
+function measuringNaiveReader(onLine) {
   let buffer = '';
   let scannedCharacters = 0;
   return {
@@ -303,29 +349,9 @@ function clientFor(mode, options = {}) {
   return { client, errors };
 }
 
-/**
- * Spending control integration test.
- *
- * Verifies that the `call_paid_resource` tool enforces per-call and session
- * spending caps. A real HTTP 402 challenge is required because the tool reads
- * the price out of the challenge body — a stub that returned a fixed price
- * would let the cap logic pass while the real parsing path was broken.
- *
- * Test setup:
- * - Per-call cap: 500 stroops
- * - Session cap: 1000 stroops
- * - Test resource: 600 stroops (exceeds the per-call cap)
- *
- * The test asserts that the 600-stroop resource is refused by the per-call cap.
- * After each test, teardown runs in reverse dependency order to ensure clean
- * shutdown: closeConnections before close so server.close() can complete its
- * handshake, and the child is killed last so it cannot outlive the fixture.
- *
- * @see {@link https://github.com/accensa/x402-facilitator-stellar/blob/main/src/mcp/cli.js | MCP CLI spending guard}
- */
-test('MCP Server Spending Controls', async t => {
-  let client;
-  const serverRef = { current: null };
+test('MCP client: a request round-trips over stdio', async t => {
+  const { client, errors } = clientFor('echo');
+  t.after(() => !client.isClosed() && client.close());
 
   const result = await client.callTool('search_resources', { query: 'weather' });
   assert.strictEqual(result.content[0].text, 'echo:search_resources');
@@ -484,43 +510,116 @@ test('MCP client: stdin failures surface as STDIN_WRITE_ERROR and STDIN_WRITE_EX
   assert.strictEqual(errorB.context.originalError, 'stdin is destroyed');
 });
 
-  const http = await import('node:http');
-  const server = http.createServer((req, res) => {
-    if (req.url === '/test-200-stroops') {
-      res.writeHead(402, { 'Content-Type': 'application/json' });
-      res.end(
-        JSON.stringify({
-          error: 'payment_required',
-          x402Version: 1,
-          accepts: [
-            {
-              scheme: 'exact',
-              network: 'stellar:testnet',
-              price: { asset: 'native', amount: '200' },
-              payTo: 'GBQ...',
-            },
-          ],
-        }),
-      );
-    } else if (req.url === '/test-600-stroops') {
-      res.writeHead(402, { 'Content-Type': 'application/json' });
-      res.end(
-        JSON.stringify({
-          error: 'payment_required',
-          x402Version: 1,
-          accepts: [
-            {
-              scheme: 'exact',
-              network: 'stellar:testnet',
-              price: { asset: 'native', amount: '600' },
-              payTo: 'GBQ...',
-            },
-          ],
-        }),
-      );
-    } else {
-      res.writeHead(404);
-      res.end();
+test('MCP client: a kill that throws is reported as KILL_ERROR, after the calls are rejected', async () => {
+  const child = new FakeChild({ killError: new Error('ESRCH') });
+  const errors = recordingOnError();
+  const client = createMcpClient(
+    {},
+    { spawn: fakeSpawn(child), onError: errors, echoStderr: false },
+  );
+
+  const pending = client.callTool('one', {});
+  client.close();
+
+  const rejected = await expectFailure(
+    pending,
+    'CLIENT_CLOSED',
+    'a call pending at a failing close',
+  );
+  assert.match(rejected.message, /client was closed/);
+
+  const killErrors = errors.errors.filter(error => error.code === 'KILL_ERROR');
+  assert.strictEqual(killErrors.length, 1, 'the failed kill is reported rather than swallowed');
+  assert.strictEqual(killErrors[0].context.originalError, 'ESRCH');
+  assert.strictEqual(client.isClosed(), true, 'the client is closed even when the kill failed');
+});
+
+/* -------------------------------------------------------------------------- *
+ * Teardown leaves nothing referenced (#388)
+ * -------------------------------------------------------------------------- */
+
+test('MCP client: a closed client leaves no referenced timer behind', async () => {
+  const child = new FakeChild();
+  const client = createMcpClient(
+    {},
+    { spawn: fakeSpawn(child), killGraceMs: 30000, echoStderr: false },
+  );
+
+  const before = process.getActiveResourcesInfo().filter(r => r === 'Timeout').length;
+  client.close();
+  const afterClose = process.getActiveResourcesInfo().filter(r => r === 'Timeout').length;
+
+  // The grace timer is unref'd, so a closed client cannot hold the process open
+  // for 30 seconds — which, before #388, was most of this suite's runtime.
+  assert.ok(
+    afterClose <= before,
+    `close() must not add a referenced timer (before ${before}, after ${afterClose})`,
+  );
+
+  // And a child that exits promptly leaves no timer at all.
+  child.emit('exit', 0, 'SIGTERM');
+  const afterExit = process.getActiveResourcesInfo().filter(r => r === 'Timeout').length;
+  assert.ok(
+    afterExit <= before,
+    `an exited child must not leave a timer behind (before ${before}, after ${afterExit})`,
+  );
+});
+
+/* -------------------------------------------------------------------------- *
+ * Benchmarks (#388)
+ * -------------------------------------------------------------------------- */
+
+/**
+ * The two shapes a stdio client really sees, and why the framer exists.
+ *
+ * It is measured two ways, because one of them is not a race: characters
+ * re-scanned is deterministic, while wall-clock is only asserted for the shape
+ * where the difference is asymptotic and therefore far outside CI noise.
+ */
+test('LineFramer: measurably less work than the loop it replaced (#388)', () => {
+  const scenarios = [
+    {
+      label: 'a burst of 200 small results',
+      payload: ndjson(200, 2000),
+      chunkSize: 1024,
+      // Each read carries about one short line, so the undelivered tail is
+      // bounded by the line length and the rescan overhead stays around 2x. The
+      // two readers are therefore within noise of each other on time here, and
+      // only the re-scan metric is asserted.
+      minRescans: 1.5,
+      maxTimeRatio: null,
+    },
+    {
+      label: 'one 256 KiB tool result on a single line',
+      payload: `${JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        result: { content: [{ type: 'text', text: 'x'.repeat(256 * 1024) }] },
+      })}\n`,
+      chunkSize: 1024,
+      // One long line in many small reads is the pathological case for the old
+      // loop: it re-splits and re-copies everything not yet delivered on every
+      // read, so the re-scan count grows with the message length over the read
+      // size (here ~128x). Measured ~0.01 of the naive time, so half is a very
+      // wide margin.
+      minRescans: 50,
+      maxTimeRatio: 0.5,
+    },
+  ];
+
+  for (const { label, payload, chunkSize, minRescans, maxTimeRatio } of scenarios) {
+    const chunks = chunkInto(payload, chunkSize);
+    const inputBytes = chunks.reduce((total, chunk) => total + chunk.length, 0);
+    assert.strictEqual(inputBytes, payload.length, 'the fixture must be delivered whole');
+
+    // 1. Identical framing: a faster framer that frames differently is useless.
+    const expected = [];
+    const actual = [];
+    const naive = measuringNaiveReader(line => expected.push(line));
+    const framer = new LineFramer(line => actual.push(line));
+    for (const chunk of chunks) {
+      naive.push(chunk);
+      framer.push(chunk);
     }
     assert.deepStrictEqual(actual, expected, `${label}: identical lines are a precondition`);
 
@@ -533,33 +632,27 @@ test('MCP client: stdin failures surface as STDIN_WRITE_ERROR and STDIN_WRITE_EX
         `(measured ${rescans.toFixed(1)}x the input, expected at least ${minRescans}x)`,
     );
 
-  await new Promise(r => server.listen(0, r));
-  serverRef.current = server;
-  const port = server.address().port;
-  const url600 = `http://localhost:${port}/test-600-stroops`;
+    // 3. Wall-clock, asserted only where the difference dominates the noise.
+    const naiveMs = fastestOf(5, () => {
+      const reader = measuringNaiveReader(() => {});
+      for (const chunk of chunks) reader.push(chunk);
+    });
+    const framerMs = fastestOf(5, () => {
+      const reader = new LineFramer(() => {});
+      for (const chunk of chunks) reader.push(chunk);
+    });
+    const ratio = framerMs / naiveMs;
 
-  /**
-   * Enforces the per-call cap: a 600-stroop resource must be refused when the
-   * cap is 500 stroops. This is the core assertion of the spending guard.
-   *
-   * The guard should reject the request and the error message must contain
-   * "Spending refused" and "exceeds per-call limit".
-   *
-   * @see {@link https://github.com/accensa/x402-facilitator-stellar/blob/main/src/mcp/cli.js | Spending guard logic}
-   */
-  await t.test('enforces per-call cap (600 > 500)', async () => {
-    try {
-      await client.callTool('call_paid_resource', { url: url600 });
-      // Reaching here means the guard let an over-cap payment through — the
-      // failure mode this whole file exists to prevent.
-      assert.fail('Should have rejected');
-    } catch (err) {
-      console.log('Caught error:', err.message);
-      assert.ok(err instanceof McpClientError || err.message, 'Error should be defined');
-      assert.match(
-        err.message,
-        /Spending refused.*exceeds per-call limit/,
-        'Error message should indicate per-call limit exceeded',
+    console.log(
+      `    ${label} (${(inputBytes / 1024).toFixed(0)} KiB in ${chunks.length} reads): ` +
+        `re-scan ${rescans.toFixed(0)}x input; naive ${naiveMs.toFixed(2)}ms, ` +
+        `framer ${framerMs.toFixed(2)}ms, ratio ${ratio.toFixed(3)}`,
+    );
+
+    if (maxTimeRatio !== null) {
+      assert.ok(
+        ratio < maxTimeRatio,
+        `${label}: the framer must be measurably faster (ratio ${ratio.toFixed(3)})`,
       );
     }
   }
